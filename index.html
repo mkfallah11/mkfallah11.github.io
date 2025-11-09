@@ -1,0 +1,424 @@
+<!-- webxr-ar-demo.html -->
+<!doctype html>
+<html lang="fa">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover" />
+  <title>WebXR AR Demo — Floating Marker</title>
+  <style>
+    :root{
+      --bg:#0f1724;
+      --card:#0b1220;
+      --accent:#4dd0e1;
+      --muted:#9aa6b2;
+      --glass: rgba(255,255,255,0.04);
+      --radius: 12px;
+    }
+    html,body{height:100%;margin:0;background:linear-gradient(180deg,#071124,#0f1724);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;}
+    #app{height:100%;display:flex;flex-direction:column;align-items:stretch;}
+    #overlayUI{position:fixed;left:12px;right:12px;top:12px;display:flex;justify-content:space-between;gap:12px;z-index:50}
+    .card{backdrop-filter:blur(6px);background:var(--glass);padding:8px;border-radius:999px;display:flex;gap:8px;align-items:center;}
+    button{background:transparent;border:1px solid rgba(255,255,255,0.06);color:white;padding:8px 12px;border-radius:10px;font-weight:600}
+    button.primary{background:linear-gradient(90deg,var(--accent),#7bdff0);color:#052026;border:0}
+    #hint{position:fixed;left:12px;bottom:16px;right:12px;color:var(--muted);font-size:13px;text-align:center;z-index:40}
+    #message{position:fixed;left:50%;transform:translateX(-50%);top:60px;background:rgba(0,0,0,0.5);padding:8px 12px;border-radius:10px;color:white;z-index:60}
+    canvas{touch-action:none}
+    /* small info card */
+    #infoCard{position:fixed;right:12px;top:70px;background:linear-gradient(180deg,#071a23,#0b1620);padding:12px;border-radius:12px;color:var(--muted);font-size:13px;z-index:60;max-width:260px}
+    #logo{display:flex;gap:8px;align-items:center}
+    #logo .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 10px var(--accent)}
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="overlayUI">
+      <div class="card">
+        <div id="logo"><div class="dot"></div><div style="font-weight:700">AR-Demo</div></div>
+      </div>
+      <div class="card" id="controls">
+        <button id="btnStart" class="primary">start ar</button>
+        <button id="btnReset">reset</button>
+        <button id="btnFallback">demo fallback</button>
+      </div>
+    </div>
+
+    <div id="message" style="display:none"></div>
+    <div id="infoCard">
+      <div style="font-weight:700;color:white">Floating Marker — demo</div>
+      <div style="margin-top:8px">نحوهٔ کار: روی start ar بزن. سپس صفحهٔ مرورگر اجازهٔ دسترسی به دوربین را می‌پرسد. گوشی را حرکت بده تا شیء در فضا دیده شود. با تپ روی شیء رنگ عوض می‌شود.</div>
+    </div>
+
+    <div id="container"></div>
+    <div id="hint">best on Chrome (Android). requires https and camera permission.</div>
+  </div>
+
+  <!-- three.js and helpers (es modules) -->
+  <script type="module">
+  // imports
+  import * as THREE from 'https://unpkg.com/three@0.152.2/build/three.module.js';
+  import { ARButton } from 'https://unpkg.com/three@0.152.2/examples/jsm/webxr/ARButton.js';
+  import { XRControllerModelFactory } from 'https://unpkg.com/three@0.152.2/examples/jsm/webxr/XRControllerModelFactory.js';
+
+  // ui elements
+  const btnStart = document.getElementById('btnStart');
+  const btnReset = document.getElementById('btnReset');
+  const btnFallback = document.getElementById('btnFallback');
+  const message = document.getElementById('message');
+  const container = document.getElementById('container');
+
+  // scene setup variables
+  let camera, scene, renderer;
+  let reticle = null; // small marker
+  let markerGroup = null;
+  let clock = new THREE.Clock();
+  let xrSessionActive = false;
+  let currentColorIndex = 0;
+  const colors = [0x4dd0e1, 0x7b61ff, 0xff7ab6, 0x6ee07a];
+
+  // show temporary messages to user
+  function showMsg(text, timeout=2500){
+    message.style.display='block';
+    message.textContent = text;
+    clearTimeout(message._t);
+    message._t = setTimeout(()=> message.style.display='none', timeout);
+  }
+
+  // basic three scene (not yet xr-enabled)
+  function initThree(){
+    // create renderer
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    container.appendChild(renderer.domElement);
+
+    // create scene and camera (camera will be controlled by XR)
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 100);
+
+    // subtle ambient and a directional light for modern look
+    const ambient = new THREE.HemisphereLight(0xffffff, 0x444444, 0.6);
+    scene.add(ambient);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(0.5, 1, 0.2);
+    scene.add(dir);
+
+    // marker group: a floating sphere + halo + label
+    markerGroup = new THREE.Group();
+    markerGroup.visible = false;
+
+    // sphere
+    const sphereGeo = new THREE.SphereGeometry(0.12, 32, 24);
+    const sphereMat = new THREE.MeshStandardMaterial({ metalness:0.3, roughness:0.2, emissive:colors[0], emissiveIntensity:0.2 });
+    const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+    sphere.name = 'markerSphere';
+
+    // halo (a thin torus)
+    const torusGeo = new THREE.TorusGeometry(0.18, 0.02, 16, 100);
+    const torusMat = new THREE.MeshBasicMaterial({ color: colors[0], transparent:true, opacity:0.9 });
+    const halo = new THREE.Mesh(torusGeo, torusMat);
+    halo.rotation.x = Math.PI / 2;
+    halo.position.y = -0.02;
+
+    // floating label (flat plane with basic text using canvas texture)
+    const labelCanvas = document.createElement('canvas');
+    labelCanvas.width = 512; labelCanvas.height = 128;
+    const ctx = labelCanvas.getContext('2d');
+    function updateLabel(text){
+      ctx.clearRect(0,0,labelCanvas.width,labelCanvas.height);
+      ctx.fillStyle = 'rgba(5,32,38,0.9)';
+      ctx.fillRect(0,0,labelCanvas.width,labelCanvas.height);
+      ctx.font = 'bold 46px system-ui';
+      ctx.fillStyle = 'white';
+      ctx.textAlign = 'center';
+      ctx.fillText(text, labelCanvas.width/2, 76);
+      labelTexture.needsUpdate = true;
+    }
+    const labelTexture = new THREE.CanvasTexture(labelCanvas);
+    const labelMat = new THREE.MeshBasicMaterial({ map: labelTexture, transparent:false });
+    const labelGeo = new THREE.PlaneGeometry(0.6, 0.15);
+    const labelMesh = new THREE.Mesh(labelGeo, labelMat);
+    labelMesh.position.y = 0.28;
+    labelMesh.lookAt(0,0,0); // will be updated each frame
+
+    updateLabel('ورودی اصلی');
+
+    // add to group
+    markerGroup.add(sphere);
+    markerGroup.add(halo);
+    markerGroup.add(labelMesh);
+    scene.add(markerGroup);
+
+    // reticle (small ring used when hit-test available)
+    const ringGeo = new THREE.RingGeometry(0.07, 0.09, 32);
+    const ringMat = new THREE.MeshBasicMaterial({ color:0xffffff, side:THREE.DoubleSide, transparent:true, opacity:0.85 });
+    reticle = new THREE.Mesh(ringGeo, ringMat);
+    reticle.rotation.x = -Math.PI / 2;
+    reticle.visible = false;
+    scene.add(reticle);
+
+    window.addEventListener('resize', onWindowResize);
+  }
+
+  function onWindowResize(){
+    if (camera){
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+    }
+    if (renderer) renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  // set marker at given position and make visible
+  function placeMarkerAt(pos, quaternion){
+    markerGroup.position.copy(pos);
+    if (quaternion) markerGroup.quaternion.copy(quaternion);
+    markerGroup.visible = true;
+    showMsg('marker placed');
+  }
+
+  // change marker color (on tap)
+  function cycleMarkerColor(){
+    currentColorIndex = (currentColorIndex + 1) % colors.length;
+    const sphere = markerGroup.getObjectByName('markerSphere');
+    sphere.material.emissive.setHex(colors[currentColorIndex]);
+    markerGroup.children.forEach(child=>{
+      if (child.material && child.material.color){
+        child.material.color.setHex(colors[currentColorIndex]);
+      }
+    });
+  }
+
+  // animate floating and halo
+  function animateMarker(delta){
+    if (!markerGroup.visible) return;
+    const t = performance.now() * 0.001;
+    markerGroup.position.y += Math.sin(t*1.5) * 0.0008; // tiny float
+    // rotate halo slowly
+    const halo = markerGroup.children.find(c=>c.geometry && c.geometry.type === 'TorusGeometry');
+    if (halo) halo.rotation.z += delta * 0.6;
+    // pulse emissive
+    const sphere = markerGroup.getObjectByName('markerSphere');
+    sphere.material.emissiveIntensity = 0.2 + Math.abs(Math.sin(t*2)) * 0.5;
+  }
+
+  // start a WebXR AR session via three's ARButton
+  async function startARSession(){
+    if (!renderer) initThree();
+
+    // create AR button (hidden) to create session
+    const arButton = ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] });
+    // programmatically click it to request permission and start session
+    arButton.style.display='none';
+    document.body.appendChild(arButton);
+    try {
+      const xrStarted = await new Promise((resolve, reject)=>{
+        // attach event listeners to detect session start
+        renderer.xr.addEventListener('sessionstart', ()=> resolve(true));
+        renderer.xr.addEventListener('sessionend', ()=> resolve(false));
+        arButton.click();
+      });
+      if (!xrStarted) {
+        showMsg('xr session not started');
+        return;
+      }
+    } catch(e){
+      console.error(e);
+      showMsg('failed to start xr: ' + (e && e.message ? e.message : e));
+      return;
+    }
+
+    // set renderer animation loop
+    renderer.setAnimationLoop(render);
+
+    // request hit test source if available
+    const session = renderer.xr.getSession();
+    xrSessionActive = true;
+
+    // preference: use viewer space for hit-test
+    let viewerSpace = await session.requestReferenceSpace('viewer').catch(()=>null);
+    if (viewerSpace){
+      const hitTestSource = await session.requestHitTestSource({ space: viewerSpace }).catch(()=>null);
+      // on each frame, we'll use hit test results to position reticle
+      session.requestAnimationFrame(function onXRFrame(time, frame){
+        // nothing here, actual rendering handled in render loop
+      });
+      // store in session for use in render
+      session._hitTestSource = hitTestSource;
+    } else {
+      // no viewer space/hit-test available – we'll fallback to fixed distance placement
+      showMsg('hit-test not available, using fixed distance placement');
+    }
+
+    showMsg('webxr session started', 2000);
+
+    // controller for tap events
+    const controller = renderer.xr.getController(0);
+    controller.addEventListener('select', onSelect);
+    scene.add(controller);
+  }
+
+  // select handler when in XR (tap on screen)
+  function onSelect(){
+    // prefer reticle if visible
+    if (reticle && reticle.visible){
+      const pos = new THREE.Vector3();
+      pos.setFromMatrixPosition(reticle.matrix);
+      // also get orientation from camera
+      const quat = new THREE.Quaternion();
+      quat.setFromRotationMatrix(reticle.matrix);
+      placeMarkerAt(pos, quat);
+      return;
+    }
+    // else place at fixed distance in front of camera (1.5m)
+    const cam = renderer.xr.getCamera(camera);
+    const dir = new THREE.Vector3(0,0,-1).applyQuaternion(cam.quaternion);
+    const pos = new THREE.Vector3().copy(cam.position).add(dir.multiplyScalar(1.5));
+    placeMarkerAt(pos, null);
+  }
+
+  // render loop
+  function render(timestamp, frame){
+    const delta = clock.getDelta();
+
+    // handle hit-test if possible
+    if (frame){
+      const session = renderer.xr.getSession();
+      if (session && session._hitTestSource){
+        const hitTestResults = frame.getHitTestResults(session._hitTestSource);
+        if (hitTestResults && hitTestResults.length > 0){
+          const hit = hitTestResults[0];
+          const pose = hit.getPose(renderer.xr.getReferenceSpace());
+          reticle.visible = true;
+          reticle.matrix.fromArray(pose.transform.matrix);
+          reticle.matrix.decompose(reticle.position, reticle.quaternion, reticle.scale);
+        } else {
+          reticle.visible = false;
+        }
+      } else {
+        // no hit test — position reticle in front of camera at fixed distance as visual guide
+        const cam = renderer.xr.getCamera(camera);
+        reticle.visible = true;
+        const dir = new THREE.Vector3(0,0,-1).applyQuaternion(cam.quaternion);
+        reticle.position.copy(cam.position).add(dir.multiplyScalar(1.6));
+        reticle.quaternion.copy(cam.quaternion);
+      }
+    } else {
+      // non-xr rendering fallback path (preview mode)
+    }
+
+    // update marker animation
+    animateMarker(delta);
+
+    // billboard the label to face camera
+    if (markerGroup.visible){
+      const label = markerGroup.children.find(c=>c.geometry && c.geometry.type === 'PlaneGeometry');
+      if (label) label.lookAt(renderer.xr.isPresenting ? renderer.xr.getCamera(camera).position : camera.position);
+    }
+
+    renderer.render(scene, camera);
+  }
+
+  // reset scene marker
+  function resetMarker(){
+    if (markerGroup) markerGroup.visible=false;
+    showMsg('reset');
+  }
+
+  // simple fallback demo using getUserMedia if WebXR not supported
+  async function startFallbackDemo(){
+    // init three if not already
+    if (!renderer) initThree();
+    // remove any XR session if present
+    if (renderer.xr && renderer.xr.getSession()){
+      try { await renderer.xr.getSession().end(); } catch(e){/*ignore*/}
+    }
+    // ask for camera permission via getUserMedia and set as video background
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio:false });
+    const video = document.createElement('video');
+    video.autoplay = true; video.playsInline = true; video.muted = true;
+    video.srcObject = stream;
+    await video.play();
+
+    // create video background as a three texture-mapped plane behind the scene
+    const videoTex = new THREE.VideoTexture(video);
+    videoTex.minFilter = THREE.LinearFilter; videoTex.magFilter = THREE.LinearFilter; videoTex.format = THREE.RGBFormat;
+    // place a large plane behind
+    const bgMat = new THREE.MeshBasicMaterial({ map: videoTex });
+    const bgGeo = new THREE.PlaneGeometry(2, 2 * (window.innerHeight / window.innerWidth));
+    const bgMesh = new THREE.Mesh(bgGeo, bgMat);
+    bgMesh.position.set(0,0,-1.5);
+    scene.add(bgMesh);
+
+    // show instructions
+    showMsg('demo mode: tap screen to place floating marker');
+
+    // simple tap handler for placement on center ray
+    renderer.domElement.style.touchAction = 'auto';
+    renderer.domElement.addEventListener('pointerdown', (e)=>{
+      // place a marker in front of camera at 1.4m
+      const pos = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion).multiplyScalar(1.4).add(camera.position);
+      placeMarkerAt(pos);
+    });
+
+    // run the render loop without xr
+    renderer.setAnimationLoop(()=> {
+      const delta = clock.getDelta();
+      animateMarker(delta);
+      if (markerGroup.visible){
+        const label = markerGroup.children.find(c=>c.geometry && c.geometry.type === 'PlaneGeometry');
+        if (label) label.lookAt(camera.position);
+      }
+      renderer.render(scene,camera);
+    });
+  }
+
+  // event wiring
+  btnStart.addEventListener('click', async ()=>{
+    if (!navigator.xr){
+      showMsg('webxr not available on this browser');
+      return;
+    }
+    // initialize three if needed
+    if (!renderer) initThree();
+    try {
+      await startARSession();
+    } catch(e){
+      console.error(e);
+      showMsg('could not start webxr: ' + (e.message || e));
+    }
+  });
+
+  btnReset.addEventListener('click', ()=> resetMarker());
+  btnFallback.addEventListener('click', ()=> {
+    if (!renderer) initThree();
+    startFallbackDemo().catch(err=> {
+      console.error(err);
+      showMsg('fallback failed: ' + (err && err.message ? err.message : err));
+    });
+  });
+
+  // interaction: toggle color when tapping on marker in fallback or when in XR via select event
+  // add a pointerdown that raycasts to sphere (for fallback mode)
+  function setupPointerInteraction(){
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    renderer.domElement.addEventListener('pointerdown', (ev)=>{
+      // calculate pointer position
+      pointer.x = (ev.clientX / window.innerWidth) * 2 - 1;
+      pointer.y = - (ev.clientY / window.innerHeight) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const intersects = raycaster.intersectObjects(markerGroup.children, true);
+      if (intersects.length > 0){
+        cycleMarkerColor();
+      }
+    });
+  }
+
+  // initialize on load for quick demo
+  initThree();
+  setupPointerInteraction();
+  showMsg('ready — use start ar or demo fallback');
+
+  </script>
+</body>
+</html>
